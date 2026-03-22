@@ -336,6 +336,7 @@ public:
 
     std::shared_ptr<DataLake::ICatalog> getCatalog(ContextPtr context, const StorageID & table_id) const override
     {
+#if USE_AVRO
         if ((*settings)[DataLakeStorageSetting::storage_catalog_type].changed || (*settings)[DataLakeStorageSetting::storage_aws_access_key_id].changed)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Don't use deprecated settings storage_catalog_type and storage_catalog_url");
         String database_name = table_id.getDatabaseName();
@@ -348,6 +349,9 @@ public:
         if (!datalake_database)
             return nullptr;
         return datalake_database->getCatalog();
+#else
+        return nullptr;
+#endif
     }
 
     bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override
