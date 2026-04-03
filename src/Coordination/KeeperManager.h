@@ -1,10 +1,10 @@
 #pragma once
 
-#include <Interpreters/OpenTelemetrySpanLog.h>
 #include "config.h"
 
 #if USE_NURAFT
 
+#include <Interpreters/OpenTelemetrySpanLog.h>
 #include <Common/ThreadPool.h>
 #include <Common/ConcurrentBoundedQueue.h>
 #include <Poco/Util/AbstractConfiguration.h>
@@ -20,50 +20,26 @@
 
 namespace DB
 {
-/// Callback invoked by setResponse and finishSession to deliver responses to clients.
-/// Must be safe for concurrent invocation: setResponse (from responseThread) and
-/// finishSession (from dead session cleaner) may invoke copies of the same callback
-/// concurrently for the same session.
-using ZooKeeperResponseCallback = std::function<void(const Coordination::ZooKeeperResponsePtr & response, Coordination::ZooKeeperRequestPtr request)>;
 
-/// Highlevel wrapper for ClickHouse Keeper.
-/// Process user requests via consensus and return responses.
-class KeeperDispatcher
+/// KeeperDispatcher[2] dispatches regular request processing, this class manages everything else:
+/// snapshots, new session id assignment, expired session cleanup etc.
+class KeeperManager
 {
 private:
-    using RequestsQueue = ConcurrentBoundedQueue<KeeperRequestForSession>;
-    using ResponsesQueue = ConcurrentBoundedQueue<KeeperResponseForSession>;
     using SessionToResponseCallback = std::unordered_map<int64_t, ZooKeeperResponseCallback>;
     using ClusterUpdateQueue = ConcurrentBoundedQueue<ClusterUpdateAction>;
 
-    /// Size depends on coordination settings
-    std::unique_ptr<RequestsQueue> requests_queue;
-    ResponsesQueue responses_queue;
     SnapshotsQueue snapshots_queue{1};
 
     /// More than 1k updates is definitely misconfiguration.
     ClusterUpdateQueue cluster_update_queue{1000};
 
-    mutable std::mutex live_sessions_mutex;
-    std::unordered_set<int64_t> live_sessions;
-
-    mutable std::mutex session_to_response_callback_mutex;
-    /// These two maps looks similar, but serves different purposes.
-    /// The first map is subscription map for normal responses like
-    /// (get, set, list, etc.). Dispatcher determines callback for each response
-    /// using session id from this map.
-    SessionToResponseCallback session_to_response_callback;
-
-    /// But when client connects to the server for the first time it doesn't
-    /// have session_id. It request it from server. We give temporary
-    /// internal id for such requests just to match client with its response.
+    /// When client connects to the server for the first time it doesn't have session_id.
+    /// It request it from server. We give temporary internal id for such requests just to match
+    /// client with its response. This is a map for that. After a proper session id is assigned,
+    /// session lives in KeeperDispatcher[2]'s session map.
     SessionToResponseCallback new_session_id_response_callback;
 
-    /// Reading and batching new requests from client handlers
-    ThreadFromGlobalPool request_thread;
-    /// Pushing responses to clients client handlers
-    /// using session_id.
-    ThreadFromGlobalPool responses_thread;
     /// Cleaning old dead sessions
     ThreadFromGlobalPool session_cleaner_thread;
     /// Dumping new snapshots to disk
@@ -73,6 +49,10 @@ private:
 
     /// RAFT wrapper.
     std::unique_ptr<KeeperServer> server;
+
+    /// Exactly one of these is non-null.
+    std::unique_ptr<KeeperDispatcher> dispatcher;
+    std::unique_ptr<KeeperDispatcher2> dispatcher2;
 
     KeeperConnectionStats keeper_stats;
 

@@ -49,6 +49,7 @@ namespace CurrentMetrics
 
 namespace ProfileEvents
 {
+    extern const Event KeeperCommitsFailed;
     extern const Event KeeperCommitWaitElapsedMicroseconds;
     extern const Event KeeperBatchMaxCount;
     extern const Event KeeperBatchMaxTotalSize;
@@ -662,7 +663,25 @@ void KeeperDispatcher::initialize(const Poco::Util::AbstractConfiguration & conf
     server = std::make_unique<KeeperServer>(
         configuration_and_settings,
         config,
-        responses_queue,
+        [this](KeeperResponseForSession response)
+        {
+            response.response->enqueue_ts = std::chrono::steady_clock::now();
+            if (response.request)
+                ZooKeeperOpentelemetrySpans::maybeInitialize(response.request->spans.dispatcher_responses_queue, response.request->tracing_context);
+            if (!responses_queue.push(std::move(response)))
+            {
+                ProfileEvents::increment(ProfileEvents::KeeperCommitsFailed);
+                LOG_WARNING(log,
+                    "Failed to push response with session id {} to the queue, probably because of shutdown",
+                    response.session_id);
+                asdqwe;
+                throw Exception(ErrorCodes::SYSTEM_ERROR,
+                    "Could not push error response xid {} zxid {} error message {} to responses queue",
+                    response->xid,
+                    response->zxid,
+                    error);
+            }
+        },
         snapshots_queue,
         keeper_context,
         snapshot_s3,
@@ -1061,7 +1080,7 @@ nuraft::ptr<nuraft::buffer> KeeperDispatcher::forceWaitAndProcessResult(
     if (!result->has_result())
         result->get();
 
-    /// If we get some errors, than send them to clients
+    /// If we get some errors, send them to clients
     if (!result->get_accepted() || result->get_result_code() == nuraft::cmd_result_code::TIMEOUT)
         addErrorResponses(requests_for_sessions, Coordination::Error::ZOPERATIONTIMEOUT);
     else if (result->get_result_code() != nuraft::cmd_result_code::OK)

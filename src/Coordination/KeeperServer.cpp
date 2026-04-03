@@ -243,7 +243,7 @@ int32_t getValueOrMaxInt32AndLogWarning(uint64_t value, const std::string & name
 KeeperServer::KeeperServer(
     const KeeperConfigurationAndSettingsPtr & configuration_and_settings_,
     const Poco::Util::AbstractConfiguration & config,
-    ResponsesQueue & responses_queue_,
+    KeeperResponseCallback & response_callback_,
     SnapshotsQueue & snapshots_queue_,
     KeeperContextPtr keeper_context_,
     KeeperSnapshotManagerS3 & snapshot_manager_s3,
@@ -263,7 +263,7 @@ KeeperServer::KeeperServer(
     if (coordination_settings[CoordinationSetting::experimental_use_rocksdb])
     {
         state_machine = nuraft::cs_new<KeeperStateMachine<KeeperRocksStorage>>(
-            responses_queue_,
+            response_callback_,
             snapshots_queue_,
             keeper_context,
             config.getBool("keeper_server.upload_snapshot_on_exit", false) ? &snapshot_manager_s3 : nullptr,
@@ -274,7 +274,7 @@ KeeperServer::KeeperServer(
     else
 #endif
         state_machine = nuraft::cs_new<KeeperStateMachine<KeeperMemoryStorage>>(
-            responses_queue_,
+            response_callback_,
             snapshots_queue_,
             keeper_context,
             config.getBool("keeper_server.upload_snapshot_on_exit", false) ? &snapshot_manager_s3 : nullptr,
@@ -289,134 +289,111 @@ KeeperServer::KeeperServer(
         keeper_context);
 }
 
-/**
- * Tiny wrapper around nuraft::raft_server which adds some functions
- * necessary for recovery, mostly connected to config manipulation.
- */
-struct KeeperServer::KeeperRaftServer : public nuraft::raft_server
+bool KeeperServer::KeeperRaftServer::isClusterHealthy()
 {
-    bool isClusterHealthy()
+    if (timer_from_init)
     {
-        if (timer_from_init)
+        size_t expiry = get_current_params().heart_beat_interval_ * raft_server::raft_limits_.response_limit_;
+
+        if (timer_from_init->elapsedMilliseconds() < expiry)
+            return false;
+
+        timer_from_init.reset();
+    }
+
+    const size_t voting_members = get_num_voting_members();
+    const auto not_responding_peers = get_not_responding_peers_count();
+    const auto quorum_size = voting_members / 2 + 1;
+    const auto max_not_responding_peers = voting_members - quorum_size;
+
+    return not_responding_peers <= max_not_responding_peers;
+}
+
+void KeeperServer::KeeperRaftServer::setConfig(const nuraft::ptr<nuraft::cluster_config> & new_config)
+{
+    set_config(new_config);
+}
+
+void KeeperServer::KeeperRaftServer::forceReconfigure(const nuraft::ptr<nuraft::cluster_config> & new_config)
+{
+    reconfigure(new_config);
+}
+
+void KeeperServer::KeeperRaftServer::commit_in_bg() override
+{
+    // For NuRaft, if any commit fails (uncaught exception) the whole server aborts as a safety
+    // This includes failed allocation which can produce an unknown state for the storage,
+    // making it impossible to handle correctly.
+    // We block the memory tracker for all the commit operations (including KeeperStateMachine::commit)
+    // assuming that the allocations are small
+    LockMemoryExceptionInThread blocker{VariableContext::Global};
+    nuraft::raft_server::commit_in_bg();
+}
+
+std::unique_lock<std::recursive_mutex> KeeperServer::KeeperRaftServer::lockRaft()
+{
+    return std::unique_lock(lock_);
+}
+
+std::unique_lock<std::mutex> KeeperServer::KeeperRaftServer::lockCommit()
+{
+    return std::unique_lock(commit_lock_);
+}
+
+bool KeeperServer::KeeperRaftServer::isCommitInProgress() const
+{
+    return sm_commit_exec_in_progress_;
+}
+
+void KeeperServer::KeeperRaftServer::setServingRequest(bool value)
+{
+    serving_req_ = value;
+}
+
+std::unordered_set<int32_t> KeeperServer::KeeperRaftServer::getLearnerIds()
+{
+    std::vector<nuraft::ptr<nuraft::srv_config>> configs;
+    get_srv_config_all(configs);
+    std::unordered_set<int32_t> learner_ids;
+    for (const auto & cfg : configs)
+        if (cfg->is_learner())
+            learner_ids.insert(cfg->get_id());
+    return learner_ids;
+}
+
+KeeperServer::RespondingCounts KeeperServer::KeeperRaftServer::getRespondingCounts()
+{
+    auto peers = get_peer_info_all();
+    auto learner_ids = getLearnerIds();
+    auto params = get_current_params();
+    uint64_t expiry_us = static_cast<uint64_t>(params.heart_beat_interval_) * raft_server::raft_limits_.response_limit_ * 1000;
+    uint64_t stale_gap = params.stale_log_gap_;
+    uint64_t last_log = get_last_log_idx();
+
+    KeeperServer::RespondingCounts counts;
+    for (const auto & peer : peers)
+    {
+        if (peer.last_succ_resp_us_ > expiry_us)
+            continue;
+
+        ++counts.learners;
+
+        bool synced = last_log <= peer.last_log_idx_ + stale_gap;
+
+        if (learner_ids.contains(peer.id_))
         {
-            size_t expiry = get_current_params().heart_beat_interval_ * raft_server::raft_limits_.response_limit_;
-
-            if (timer_from_init->elapsedMilliseconds() < expiry)
-                return false;
-
-            timer_from_init.reset();
-        }
-
-        const size_t voting_members = get_num_voting_members();
-        const auto not_responding_peers = get_not_responding_peers_count();
-        const auto quorum_size = voting_members / 2 + 1;
-        const auto max_not_responding_peers = voting_members - quorum_size;
-
-        return not_responding_peers <= max_not_responding_peers;
-    }
-
-    // Manually set the internal config of the raft server
-    // This should be used only for recovery
-    void setConfig(const nuraft::ptr<nuraft::cluster_config> & new_config)
-    {
-        set_config(new_config);
-    }
-
-    // Manually reconfigure the cluster
-    // This should be used only for recovery
-    void forceReconfigure(const nuraft::ptr<nuraft::cluster_config> & new_config)
-    {
-        reconfigure(new_config);
-    }
-
-    void commit_in_bg() override
-    {
-        // For NuRaft, if any commit fails (uncaught exception) the whole server aborts as a safety
-        // This includes failed allocation which can produce an unknown state for the storage,
-        // making it impossible to handle correctly.
-        // We block the memory tracker for all the commit operations (including KeeperStateMachine::commit)
-        // assuming that the allocations are small
-        LockMemoryExceptionInThread blocker{VariableContext::Global};
-        nuraft::raft_server::commit_in_bg();
-    }
-
-    std::unique_lock<std::recursive_mutex> lockRaft()
-    {
-        return std::unique_lock(lock_);
-    }
-
-    std::unique_lock<std::mutex> lockCommit()
-    {
-        return std::unique_lock(commit_lock_);
-    }
-
-    bool isCommitInProgress() const
-    {
-        return sm_commit_exec_in_progress_;
-    }
-
-    void setServingRequest(bool value)
-    {
-        serving_req_ = value;
-    }
-
-    /// Collect IDs of learner (non-voting) servers from the cluster config.
-    std::unordered_set<int32_t> getLearnerIds()
-    {
-        std::vector<nuraft::ptr<nuraft::srv_config>> configs;
-        get_srv_config_all(configs);
-        std::unordered_set<int32_t> learner_ids;
-        for (const auto & cfg : configs)
-            if (cfg->is_learner())
-                learner_ids.insert(cfg->get_id());
-        return learner_ids;
-    }
-
-    /// Returns alive (responding) learner and follower counters.
-    /// Follower counters include only voting peers; learners include all peers.
-    /// Both get_peer_info_all and get_srv_config_all hold the raft lock internally.
-    KeeperServer::RespondingCounts getRespondingCounts()
-    {
-        auto peers = get_peer_info_all();
-        auto learner_ids = getLearnerIds();
-        auto params = get_current_params();
-        uint64_t expiry_us = static_cast<uint64_t>(params.heart_beat_interval_) * raft_server::raft_limits_.response_limit_ * 1000;
-        uint64_t stale_gap = params.stale_log_gap_;
-        uint64_t last_log = get_last_log_idx();
-
-        KeeperServer::RespondingCounts counts;
-        for (const auto & peer : peers)
-        {
-            if (peer.last_succ_resp_us_ > expiry_us)
-                continue;
-
-            ++counts.learners;
-
-            bool synced = last_log <= peer.last_log_idx_ + stale_gap;
-
-            if (learner_ids.contains(peer.id_))
-            {
-                if (synced)
-                    ++counts.synced_non_voting_followers;
-                continue;
-            }
-
-            ++counts.followers;
             if (synced)
-                ++counts.synced_followers;
+                ++counts.synced_non_voting_followers;
+            continue;
         }
 
-        return counts;
+        ++counts.followers;
+        if (synced)
+            ++counts.synced_followers;
     }
 
-    using nuraft::raft_server::raft_server;
-
-    // peers are initially marked as responding because at least one cycle
-    // of heartbeat * response_limit (20) need to pass to be marked
-    // as not responding
-    // until that time passes we can't say that the cluster is healthy
-    std::optional<Stopwatch> timer_from_init = std::make_optional<Stopwatch>();
-};
+    return counts;
+}
 
 void KeeperServer::loadLatestConfig()
 {
