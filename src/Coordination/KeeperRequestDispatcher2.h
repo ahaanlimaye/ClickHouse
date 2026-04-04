@@ -63,8 +63,6 @@ public:
     bool putRequest(const Coordination::ZooKeeperRequestPtr & request, int64_t session_id, bool use_xid_64);
     bool putLocalReadRequest(const Coordination::ZooKeeperRequestPtr & request, int64_t session_id);
 
-    /// For every registerSession call there must eventually be a finishSession call
-    /// (except during shutdown asdqwe
     void registerSession(int64_t session_id, ZooKeeperResponseCallback callback);
     void finishSession(int64_t session_id);
 
@@ -146,7 +144,6 @@ private:
     /// True if no requests sent through the current `stream` succeeded yet.
     std::atomic<bool> current_stream_is_suspect {};
 
-    //asdqwe add byte limit (or update comment at the top claiming that such limit exists)
     NonblockingBoundedQueue<KeeperRequestForSession> requests_queue;
     std::atomic<size_t> requests_queue_bytes {};
 

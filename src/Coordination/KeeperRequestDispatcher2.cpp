@@ -42,12 +42,21 @@ namespace DB
 
 namespace CoordinationSetting
 {
+    extern const CoordinationSettingsUInt64 dispatch_busy_wait_sleep_us;
+    extern const CoordinationSettingsUInt64 max_in_flight_request_batches;
+    extern const CoordinationSettingsUInt64 max_read_batch_bytes_size;
+    extern const CoordinationSettingsUInt64 max_read_batch_size;
+    extern const CoordinationSettingsUInt64 max_request_queue_bytes_size;
     extern const CoordinationSettingsUInt64 max_request_queue_size;
     extern const CoordinationSettingsUInt64 max_requests_batch_bytes_size;
     extern const CoordinationSettingsUInt64 max_requests_batch_size;
+    extern const CoordinationSettingsUInt64 max_response_queue_bytes_size;
     extern const CoordinationSettingsMilliseconds operation_timeout_ms;
+    extern const CoordinationSettingsBool optimize_read_order;
     extern const CoordinationSettingsBool quorum_reads;
     extern const CoordinationSettingsMilliseconds session_shutdown_timeout;
+    extern const CoordinationSettingsMilliseconds stream_in_flight_drain_timeout_ms;
+    extern const CoordinationSettingsMilliseconds stream_suspect_retry_delay_ms;
 }
 
 namespace ErrorCodes
@@ -145,8 +154,7 @@ KeeperRequestDispatcher2::KeeperRequestDispatcher2(KeeperServer * server_)
     dispatch_thread = ThreadFromGlobalPool([this] { dispatchThread(); });
     response_thread = ThreadFromGlobalPool([this] { responseThread(); });
 
-    //TODO: setting
-    in_flight_batches = std::vector<InFlightBatch>(20);
+    in_flight_batches = std::vector<InFlightBatch>(coordination_settings[CoordinationSetting::max_in_flight_request_batches]);
 }
 
 void KeeperRequestDispatcher2::shutdown(bool closed_all_connections)
@@ -241,10 +249,10 @@ bool KeeperRequestDispatcher2::putRequest(const Coordination::ZooKeeperRequestPt
 
     ZooKeeperOpentelemetrySpans::maybeInitialize(request->spans.dispatcher_requests_queue, request->tracing_context);
 
+    uint64_t max_request_queue_bytes = keeper_context->getCoordinationSettings()[CoordinationSetting::max_request_queue_bytes_size];
     auto try_push = [&]
     {
-        //TODO: setting
-        return requests_queue_bytes.load() <= 100000000 && requests_queue.tryPush(std::move(request_info));
+        return requests_queue_bytes.load() <= max_request_queue_bytes && requests_queue.tryPush(std::move(request_info));
     };
 
     if (!try_push())
@@ -304,10 +312,10 @@ bool KeeperRequestDispatcher2::tryPopRequest(KeeperRequestForSession & request)
 void KeeperRequestDispatcher2::onResponse(KeeperResponseForSession response) noexcept
 {
     size_t bytes = getResponseBytesCost(*response.response);
+    uint64_t max_response_queue_bytes = keeper_context->getCoordinationSettings()[CoordinationSetting::max_response_queue_bytes_size];
     auto try_push = [&]
     {
-        //TODO: setting (same as in dispatchThread, not divided by two this time)
-        return response_bytes_in_all_queues.load() <= 100000000 && responses_queue.tryPush(std::move(response));
+        return response_bytes_in_all_queues.load() <= max_response_queue_bytes && responses_queue.tryPush(std::move(response));
     };
 
     if (!try_push())
@@ -330,8 +338,8 @@ void KeeperRequestDispatcher2::onResponse(KeeperResponseForSession response) noe
             if (try_push())
                 break;
 
-            //TODO: setting
-            if (std::chrono::steady_clock::now() - start_time > std::chrono::milliseconds(1000))
+            if (std::chrono::steady_clock::now() - start_time > std::chrono::milliseconds(
+                    keeper_context->getCoordinationSettings()[CoordinationSetting::operation_timeout_ms].totalMilliseconds()))
             {
                 /// Just drop responses on the floor, I guess. The client will eventually time out
                 /// and close the socket. This is a weird enough situation that idk how it would
@@ -417,10 +425,10 @@ void KeeperRequestDispatcher2::dispatchThread()
                     if (slept >= std::chrono::milliseconds(operation_timeout_ms) || shutting_down.load())
                         break;
                     if (server->isLeaderAlive() &&
-                        //TODO: coordination setting for retry delay
-                        (!current_stream_is_suspect.load() || slept >= std::chrono::milliseconds(1000)) &&
-                        //TODO: setting
-                        (head_idx.load() == tail_idx.load() || slept >= std::chrono::milliseconds(5000)))
+                        (!current_stream_is_suspect.load() || slept >= std::chrono::milliseconds(
+                            keeper_context->getCoordinationSettings()[CoordinationSetting::stream_suspect_retry_delay_ms].totalMilliseconds())) &&
+                        (head_idx.load() == tail_idx.load() || slept >= std::chrono::milliseconds(
+                            keeper_context->getCoordinationSettings()[CoordinationSetting::stream_in_flight_drain_timeout_ms].totalMilliseconds())))
                         break;
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
@@ -456,10 +464,14 @@ void KeeperRequestDispatcher2::dispatchThread()
             /// Check that we don't have too many running requests already.
             /// Currently no limit on byte size or request count, only batch count;
             /// batch size limit x batch count limit is hoped to be sufficient.
+            /// Also check that we don't have lots of pending responses to send; may be useful
+            /// if there are lots of big reads, so a moderate number of requests are producing lots
+            /// of bytes of responses, so we may be bottlenecked by sending those responses through
+            /// network.
             size_t batch_idx = tail_idx.load();
             size_t num_batches_in_flight = batch_idx - head_idx.load();
-            //TODO: settings for response queue byte size limit; use half that limit here
-            if (num_batches_in_flight >= in_flight_batches.size() || response_bytes_in_all_queues.load() > 100000000)
+            uint64_t max_response_queue_bytes = keeper_context->getCoordinationSettings()[CoordinationSetting::max_response_queue_bytes_size];
+            if (num_batches_in_flight >= in_flight_batches.size() || response_bytes_in_all_queues.load() > max_response_queue_bytes / 2)
             {
                 /// Too many batches in flight. Busy-wait.
                 ///
@@ -497,8 +509,8 @@ void KeeperRequestDispatcher2::dispatchThread()
                 ///  Or maybe there are conditions where this breaks and we instead converge to
                 ///  issuing bursts of 100 requests every 5 seconds, with corresponding
                 ///  throughput of 20 requests/s?)
-                //TODO: setting
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                std::this_thread::sleep_for(std::chrono::microseconds(
+                    keeper_context->getCoordinationSettings()[CoordinationSetting::dispatch_busy_wait_sleep_us]));
                 continue;
             }
 
@@ -509,8 +521,8 @@ void KeeperRequestDispatcher2::dispatchThread()
                 /// No requests to process. Busy-wait here too.
                 /// TODO: Perhaps we should replace this with a futex wait to improve throughput on
                 ///       latency-bound workloads. E.g. one client doing blocking requests in a loop.
-                //TODO: setting
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                std::this_thread::sleep_for(std::chrono::microseconds(
+                    keeper_context->getCoordinationSettings()[CoordinationSetting::dispatch_busy_wait_sleep_us]));
                 continue;
             }
 
@@ -520,10 +532,9 @@ void KeeperRequestDispatcher2::dispatchThread()
             uint64_t max_batch_bytes_size = coordination_settings[CoordinationSetting::max_requests_batch_bytes_size];
             size_t max_batch_size = coordination_settings[CoordinationSetting::max_requests_batch_size];
             bool quorum_reads = coordination_settings[CoordinationSetting::quorum_reads];
-            /// TODO: Take these from settings once https://github.com/ClickHouse/ClickHouse/pull/100778 lands.
-            size_t max_read_batch_size = 100000;
-            size_t max_read_batch_bytes_size = 10000000;
-            bool optimize_read_order = true; //TODO: setting (say it's temporary, just for benchmarking against previous dispatcher impl, will be removed and be always true)
+            size_t max_read_batch_size = coordination_settings[CoordinationSetting::max_read_batch_size];
+            size_t max_read_batch_bytes_size = coordination_settings[CoordinationSetting::max_read_batch_bytes_size];
+            bool optimize_read_order = coordination_settings[CoordinationSetting::optimize_read_order];
             bool is_exceeding_memory_soft_limit = server->isExceedingMemorySoftLimit();
 
             KeeperRequestsForSessions requests;
@@ -813,8 +824,8 @@ void KeeperRequestDispatcher2::responseThread()
             if (!responses_queue.tryPop(response_for_session))
             {
                 /// Busy-wait.
-                //TODO: setting, same one as for request queue
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                std::this_thread::sleep_for(std::chrono::microseconds(
+                    keeper_context->getCoordinationSettings()[CoordinationSetting::dispatch_busy_wait_sleep_us]));
                 continue;
             }
 

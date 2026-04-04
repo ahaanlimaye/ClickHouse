@@ -83,6 +83,7 @@ namespace CoordinationSetting
     extern const CoordinationSettingsUInt64 stale_log_gap;
     extern const CoordinationSettingsMilliseconds startup_timeout;
     extern const CoordinationSettingsBool nuraft_test_mode;
+    extern const CoordinationSettingsBool asio_streaming_mode;
 }
 
 namespace ErrorCodes
@@ -544,6 +545,8 @@ void KeeperServer::launchRaftServer(const Poco::Util::AbstractConfiguration & co
     /// asio is async framework, so even with 1 thread it should be ok, but
     /// still as safeguard it's better to have some redundant capacity here
     asio_opts.thread_pool_size_ = std::max(16U, getNumberOfCPUCoresToUse());
+
+    asio_opts.streaming_mode_ = coordination_settings[CoordinationSetting::asio_streaming_mode];
 
     if (state_manager->isSecure())
     {
