@@ -1,5 +1,9 @@
 #pragma once
 
+#include <atomic>
+#include <vector>
+#include <Common/BitHelpers.h>
+
 /// Vyukov queue.
 /// Lock-free. Fixed preallocated capacity.
 /// No blocking operations, only tryPush/tryPop; you may need a separate condition_variable/futex/etc or busy-wait.
@@ -51,8 +55,15 @@ template <typename T>
 class NonblockingBoundedQueue
 {
 public:
+    NonblockingBoundedQueue() = default; // must call init() before using
     NonblockingBoundedQueue(size_t min_capacity)
     {
+        init(min_capacity);
+    }
+
+    void init(size_t min_capacity)
+    {
+        chassert(!mask);
         /// (Capacity must be at least 2 to make `pos + 1` different from `pos + capacity`.)
         while (min_capacity < 2 || !isPowerOf2(min_capacity))
             ++min_capacity;
@@ -65,6 +76,7 @@ public:
     /// `value` is moved-out iff the return value is true.
     bool tryPush(T && value)
     {
+        chassert(mask);
         size_t pos = enqueue_pos.load();
         while (true)
         {
@@ -95,6 +107,7 @@ public:
 
     bool tryPop(T & out_value)
     {
+        chassert(mask);
         size_t pos = dequeue_pos.load();
         while (true)
         {
@@ -123,8 +136,15 @@ public:
         }
     }
 
+    size_t size() const
+    {
+        size_t y = dequeue_pos.load();
+        size_t x = enqueue_pos.load();
+        return x - std::min(x, y); // max(0, x - y)
+    }
+
 private:
-    struct alignas(CH_CACHE_LINE_SIZE) Slot
+    struct alignas(DB::CH_CACHE_LINE_SIZE) Slot
     {
         std::atomic<size_t> pos;
         T value;
@@ -132,6 +152,6 @@ private:
 
     size_t mask = 0; // capacity - 1
     std::vector<Slot> slots;
-    alignas(CH_CACHE_LINE_SIZE) std::atomic<size_t> enqueue_pos;
-    alignas(CH_CACHE_LINE_SIZE) std::atomic<size_t> dequeue_pos;
+    alignas(DB::CH_CACHE_LINE_SIZE) std::atomic<size_t> enqueue_pos;
+    alignas(DB::CH_CACHE_LINE_SIZE) std::atomic<size_t> dequeue_pos;
 };

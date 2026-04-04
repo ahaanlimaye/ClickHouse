@@ -38,11 +38,13 @@ public:
     void markAsBroken();
 
     /// Send requests. Not thread safe.
-    /// The returned future is set to true if/when the leader accepts the entries for processing;
-    /// the entries may still get lost after that, the real confirmation is commit callback.
+    /// callback(true) is called if the leader accepts entries for processing
+    ///   (entries may still get lost after that, the real confirmation is commit callback).
+    /// callback(false) is called if anything fails.
+    /// callback may be called inline.
     /// Set to false if/when the stream is broken.
-    /// It's ok to ignore the returned future and rely on isBroken() for errors and commit callback for successes.
-    std::future<bool> putRequestBatch(const KeeperRequestsForSessions & requests_for_sessions);
+    /// It's ok to not use the callback and rely on isBroken() for errors and commit callback for successes.
+    void putRequestBatch(const KeeperRequestsForSessions & requests_for_sessions, std::function<void(bool)> callback = nullptr);
 
 private:
     KeeperServer * server;

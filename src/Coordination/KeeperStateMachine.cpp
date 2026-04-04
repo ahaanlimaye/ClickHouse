@@ -72,7 +72,7 @@ namespace ErrorCodes
 }
 
 IKeeperStateMachine::IKeeperStateMachine(
-    KeeperResponseCallback & response_callback_,
+    KeeperResponseCallback response_callback_,
     SnapshotsQueue & snapshots_queue_,
     const KeeperContextPtr & keeper_context_,
     KeeperSnapshotManagerS3 * snapshot_manager_s3_,
@@ -92,7 +92,7 @@ IKeeperStateMachine::IKeeperStateMachine(
 
 template<typename Storage>
 KeeperStateMachine<Storage>::KeeperStateMachine(
-    KeeperResponseCallback & response_callback_,
+    KeeperResponseCallback response_callback_,
     SnapshotsQueue & snapshots_queue_,
     // const CoordinationSettingsPtr & coordination_settings_,
     const KeeperContextPtr & keeper_context_,

@@ -477,17 +477,23 @@ void KeeperTCPHandler::runImpl()
 
     max_request_size = static_cast<UInt64>(keeper_context->getCoordinationSettings()[CoordinationSetting::max_request_size]);
 
-    auto response_callback = [my_responses = this->responses, my_poll_wrapper = this->poll_wrapper](
-                                 const Coordination::ZooKeeperResponsePtr & response, Coordination::ZooKeeperRequestPtr request)
+    auto response_callback = [my_responses = this->responses, my_poll_wrapper = this->poll_wrapper, dispatcher = keeper_dispatcher.get()](
+                                 const Coordination::ZooKeeperResponsePtr & response, Coordination::ZooKeeperRequestPtr request) -> bool
     {
         if (request)
             ZooKeeperOpentelemetrySpans::maybeInitialize(request->spans.send_response, request->tracing_context);
 
         if (!my_responses->push(RequestWithResponse{response, std::move(request)}))
-            throw Exception(ErrorCodes::SYSTEM_ERROR, "Could not push response with xid {} and zxid {}", response->xid, response->zxid);
+        {
+            if (!my_responses->isFinished())
+                throw Exception(ErrorCodes::SYSTEM_ERROR, "Could not push response with xid {} and zxid {}", response->xid, response->zxid);
+            return false;
+        }
 
         UInt8 single_byte = 1;
         [[maybe_unused]] ssize_t result = write(my_poll_wrapper->getResponseFD(), &single_byte, sizeof(single_byte));
+
+        return true; // will call onResponseDeallocated on dequeue
     };
     keeper_dispatcher->registerSession(session_id, response_callback);
 
@@ -504,6 +510,17 @@ void KeeperTCPHandler::runImpl()
     session_stopwatch.start();
     connected.store(true, std::memory_order_release);
     bool close_received = false;
+
+    SCOPE_EXIT({
+        keeper_dispatcher->finishSession(session_id);
+        responses->finish();
+        RequestWithResponse request_with_response;
+        size_t bytes = 0;
+        while (responses->tryPop(request_with_response))
+        {
+            keeper_dispatcher->onResponseDeallocated(*request_with_response.response);
+        }
+    });
 
     try
     {
@@ -528,7 +545,6 @@ void KeeperTCPHandler::runImpl()
                 if (in->eof())
                 {
                     LOG_DEBUG(log, "Client closed connection, session id #{}", session_id);
-                    keeper_dispatcher->finishSession(session_id);
                     break;
                 }
 
@@ -562,6 +578,9 @@ void KeeperTCPHandler::runImpl()
 
                 if (!responses->tryPop(request_with_response))
                     throw Exception(ErrorCodes::LOGICAL_ERROR, "We must have ready response, but queue is empty. It's a bug.");
+
+                /// (Not quite deallocated yet, but close enough for our purposes.)
+                keeper_dispatcher->onResponseDeallocated(*request_with_response.response);
 
                 auto & response = request_with_response.response;
                 auto & request = request_with_response.request;
@@ -613,7 +632,6 @@ void KeeperTCPHandler::runImpl()
                 if (response->error == Coordination::Error::ZSESSIONEXPIRED)
                 {
                     LOG_DEBUG(log, "Session #{} expired because server shutting down or quorum is not alive", session_id);
-                    keeper_dispatcher->finishSession(session_id);
                     return;
                 }
 
@@ -626,7 +644,6 @@ void KeeperTCPHandler::runImpl()
             if (session_stopwatch.elapsedMicroseconds() > static_cast<UInt64>(session_timeout.totalMicroseconds()))
             {
                 LOG_DEBUG(log, "Session #{} expired", session_id);
-                keeper_dispatcher->finishSession(session_id);
                 break;
             }
         }
@@ -638,7 +655,6 @@ void KeeperTCPHandler::runImpl()
         LOG_TRACE(log, "Has {} responses in the queue", responses->size());
         LOG_INFO(log, "Got exception processing session #{}: {}", session_id, getExceptionMessage(ex, true));
         cancelWriteBuffer();
-        keeper_dispatcher->finishSession(session_id);
     }
 }
 

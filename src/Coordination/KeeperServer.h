@@ -122,11 +122,13 @@ private:
 
     const bool create_snapshot_on_exit;
     const bool enable_reconfiguration;
+    const bool is_standalone_keeper;
+
 public:
     KeeperServer(
         const KeeperConfigurationAndSettingsPtr & settings_,
         const Poco::Util::AbstractConfiguration & config_,
-        KeeperResponseCallback & response_callback_,
+        KeeperResponseCallback response_callback_,
         SnapshotsQueue & snapshots_queue_,
         KeeperContextPtr keeper_context_,
         KeeperSnapshotManagerS3 & snapshot_manager_s3,
@@ -141,6 +143,10 @@ public:
 
     bool isRecovering() const { return is_recovering; }
     bool reconfigEnabled() const { return enable_reconfiguration; }
+
+    /// Put batch of requests into Raft and get result of put. Responses will be sent separately
+    /// through response_callback.
+    RaftAppendResult putRequestBatch(const KeeperRequestsForSessions & requests);
 
     /// Return set of the non-active sessions
     std::vector<int64_t> getDeadSessions();
@@ -203,6 +209,8 @@ public:
     void recalculateStorageStats();
 
     std::optional<AuthenticationData> getAuthenticationData() const { return state_manager->getAuthenticationData(); }
+
+    const KeeperContextPtr & getKeeperContext() const { return keeper_context; }
 };
 
 }

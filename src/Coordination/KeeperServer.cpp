@@ -243,7 +243,7 @@ int32_t getValueOrMaxInt32AndLogWarning(uint64_t value, const std::string & name
 KeeperServer::KeeperServer(
     const KeeperConfigurationAndSettingsPtr & configuration_and_settings_,
     const Poco::Util::AbstractConfiguration & config,
-    KeeperResponseCallback & response_callback_,
+    KeeperResponseCallback response_callback_,
     SnapshotsQueue & snapshots_queue_,
     KeeperContextPtr keeper_context_,
     KeeperSnapshotManagerS3 & snapshot_manager_s3,
@@ -254,6 +254,7 @@ KeeperServer::KeeperServer(
     , keeper_context{std::move(keeper_context_)}
     , create_snapshot_on_exit(config.getBool("keeper_server.create_snapshot_on_exit", true))
     , enable_reconfiguration(config.getBool("keeper_server.enable_reconfiguration", false))
+    , is_standalone_keeper(configuration_and_settings_->standalone_keeper)
 {
     if (keeper_context->getCoordinationSettings()[CoordinationSetting::quorum_reads])
         LOG_WARNING(log, "Quorum reads enabled, Keeper will work slower.");
@@ -319,7 +320,7 @@ void KeeperServer::KeeperRaftServer::forceReconfigure(const nuraft::ptr<nuraft::
     reconfigure(new_config);
 }
 
-void KeeperServer::KeeperRaftServer::commit_in_bg() override
+void KeeperServer::KeeperRaftServer::commit_in_bg()
 {
     // For NuRaft, if any commit fails (uncaught exception) the whole server aborts as a safety
     // This includes failed allocation which can produce an unknown state for the storage,
@@ -715,10 +716,6 @@ RaftAppendResult KeeperServer::putRequestBatch(const KeeperRequestsForSessions &
     for (const auto & request_for_session : requests_for_sessions)
         entries.push_back(IKeeperStateMachine::getZooKeeperLogEntry(request_for_session));
 
-    ProfiledMutexLock lock(server_write_mutex, ProfileEvents::KeeperServerWriteLockWaitMicroseconds, ProfileEvents::KeeperServerWriteLockHoldMicroseconds);
-    if (is_recovering)
-        return nullptr;
-
     return raft_instance->append_entries(entries);
 }
 
@@ -745,6 +742,8 @@ bool KeeperServer::isLeaderAlive() const
 
 bool KeeperServer::isExceedingMemorySoftLimit() const
 {
+    if (!is_standalone_keeper)
+        return false;
     Int64 mem_soft_limit = keeper_context->getKeeperMemorySoftLimit();
     return mem_soft_limit > 0 && std::max(total_memory_tracker.get(), total_memory_tracker.getRSS()) >= mem_soft_limit;
 }
