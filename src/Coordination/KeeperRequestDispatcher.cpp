@@ -1,5 +1,7 @@
 #include <Coordination/KeeperRequestDispatcher.h>
 
+#if USE_NURAFT
+
 #include <Coordination/KeeperDispatcher.h>
 #include <Common/ProfiledLocks.h>
 #include <libnuraft/async.hxx>
@@ -156,14 +158,13 @@ bool checkIfRequestIncreaseMem(const Coordination::ZooKeeperRequestPtr & request
 
 }
 
-KeeperRequestDispatcher::KeeperRequestDispatcher(KeeperServer * server_, KeeperConnectionStats * keeper_stats_)
+KeeperRequestDispatcher::KeeperRequestDispatcher(KeeperServer * server_)
     : responses_queue(std::numeric_limits<size_t>::max())
     , server(server_)
-    , keeper_stats(keeper_stats_)
     , log(getLogger("KeeperRequestDispatcher"))
-    , keeper_context(server->getKeeperContext());
+    , keeper_context(server->getKeeperContext())
 {
-    requests_queue = std::make_unique<RequestsQueue>(configuration_and_settings->coordination_settings[CoordinationSetting::max_request_queue_size]);
+    requests_queue = std::make_unique<RequestsQueue>(keeper_context->getCoordinationSettings()[CoordinationSetting::max_request_queue_size]);
     request_thread = ThreadFromGlobalPool([this] { requestThread(); });
     responses_thread = ThreadFromGlobalPool([this] { responseThread(); });
 }
@@ -291,7 +292,7 @@ void KeeperRequestDispatcher::requestThread()
 
         KeeperRequestForSession request;
 
-        const auto & coordination_settings = configuration_and_settings->coordination_settings;
+        const auto & coordination_settings = keeper_context->getCoordinationSettings();
         uint64_t max_wait = coordination_settings[CoordinationSetting::operation_timeout_ms].totalMilliseconds();
         uint64_t max_batch_bytes_size = coordination_settings[CoordinationSetting::max_requests_batch_bytes_size];
         size_t max_batch_size = coordination_settings[CoordinationSetting::max_requests_batch_size];
@@ -353,7 +354,7 @@ void KeeperRequestDispatcher::requestThread()
                 handle_opentelemetery_spans(request.request, request.session_id);
 
                 Int64 mem_soft_limit = keeper_context->getKeeperMemorySoftLimit();
-                if (isExceedingMemorySoftLimit() && checkIfRequestIncreaseMem(request.request))
+                if (server->isExceedingMemorySoftLimit() && checkIfRequestIncreaseMem(request.request))
                 {
                     ProfileEvents::increment(ProfileEvents::KeeperRequestRejectedDueToSoftMemoryLimitCount, 1);
                     LOG_WARNING(
@@ -555,7 +556,7 @@ void KeeperRequestDispatcher::responseThread()
     {
         KeeperResponseForSession response_for_session;
 
-        uint64_t max_wait = configuration_and_settings->coordination_settings[CoordinationSetting::operation_timeout_ms].totalMilliseconds();
+        uint64_t max_wait = keeper_context->getCoordinationSettings()[CoordinationSetting::operation_timeout_ms].totalMilliseconds();
 
         if (responses_queue.tryPop(response_for_session, max_wait))
         {
@@ -660,7 +661,7 @@ bool KeeperRequestDispatcher::putRequest(const Coordination::ZooKeeperRequestPtr
 
     ZooKeeperOpentelemetrySpans::maybeInitialize(request->spans.dispatcher_requests_queue, request->tracing_context);
 
-    if (!requests_queue->tryPush(std::move(request_info), configuration_and_settings->coordination_settings[CoordinationSetting::operation_timeout_ms].totalMilliseconds()))
+    if (!requests_queue->tryPush(std::move(request_info), keeper_context->getCoordinationSettings()[CoordinationSetting::operation_timeout_ms].totalMilliseconds()))
     {
         throw Exception(ErrorCodes::TIMEOUT_EXCEEDED, "Cannot push request to queue within operation timeout");
     }
@@ -763,7 +764,7 @@ void KeeperRequestDispatcher::shutdown()
                                         nuraft::cmd_result<nuraft::ptr<nuraft::buffer>> & /*result*/,
                                         nuraft::ptr<std::exception> & /*exception*/) { my_sessions_closing_done_promise->set_value(); });
 
-            auto session_shutdown_timeout = configuration_and_settings->coordination_settings[CoordinationSetting::session_shutdown_timeout].totalMilliseconds();
+            auto session_shutdown_timeout = keeper_context->getCoordinationSettings()[CoordinationSetting::session_shutdown_timeout].totalMilliseconds();
             if (sessions_closing_done.wait_for(std::chrono::milliseconds(session_shutdown_timeout)) != std::future_status::ready)
                 LOG_WARNING(
                     log,
@@ -892,3 +893,5 @@ nuraft::ptr<nuraft::buffer> KeeperRequestDispatcher::forceWaitAndProcessResult(
 }
 
 }
+
+#endif

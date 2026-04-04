@@ -46,7 +46,6 @@ private:
     ThreadFromGlobalPool responses_thread;
 
     KeeperServer * server;
-    KeeperConnectionStats * keeper_stats;
 
     LoggerPtr log;
 
@@ -75,7 +74,7 @@ private:
         RaftAppendResult & result, KeeperRequestsForSessions & requests_for_sessions, bool clear_requests_on_success);
 
 public:
-    KeeperRequestDispatcher(KeeperServer * server_, KeeperConnectionStats * keeper_stats_);
+    explicit KeeperRequestDispatcher(KeeperServer * server_);
 
     void shutdown();
 
@@ -90,7 +89,7 @@ public:
     void registerSession(int64_t session_id, ZooKeeperResponseCallback callback);
 
     /// Call if we don't need any responses for this session no more (session was expired)
-    void finishSession(int64_t session_id, KeeperRequestForSession close_request);
+    void finishSession(int64_t session_id);
 
     void onResponse(KeeperResponseForSession response) noexcept;
     void onCommit(const KeeperRequestForSession & request_for_session);

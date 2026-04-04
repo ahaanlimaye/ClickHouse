@@ -747,7 +747,7 @@ struct ContextSharedPart : boost::noncopyable
         {
             try
             {
-                keeper_dispatcher->shutdown();
+                keeper_dispatcher->shutdown(false);
             }
             catch (...)
             {

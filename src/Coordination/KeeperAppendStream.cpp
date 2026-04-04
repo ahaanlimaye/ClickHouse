@@ -19,6 +19,16 @@ namespace CoordinationSetting
 
 KeeperAppendStream::KeeperAppendStream(KeeperServer * server_) : server(server_) {}
 
+bool KeeperAppendStream::isBroken() const
+{
+    return is_broken->load();
+}
+
+void KeeperAppendStream::markAsBroken()
+{
+    is_broken->store(true);
+}
+
 void KeeperAppendStream::putRequestBatch(const KeeperRequestsForSessions & requests_for_sessions, std::function<void(bool)> callback)
 {
     if (isBroken())

@@ -515,7 +515,6 @@ void KeeperTCPHandler::runImpl()
         keeper_dispatcher->finishSession(session_id);
         responses->finish();
         RequestWithResponse request_with_response;
-        size_t bytes = 0;
         while (responses->tryPop(request_with_response))
         {
             keeper_dispatcher->onResponseDeallocated(*request_with_response.response);

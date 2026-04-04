@@ -1,4 +1,7 @@
 #include <Coordination/KeeperDispatcher.h>
+
+#if USE_NURAFT
+
 #include <Common/ProfiledLocks.h>
 #include <libnuraft/async.hxx>
 
@@ -145,7 +148,7 @@ void KeeperDispatcher::initialize(const Poco::Util::AbstractConfiguration & conf
     if (keeper_context->getCoordinationSettings()[CoordinationSetting::use_new_dispatcher])
         dispatcher2 = std::make_unique<KeeperRequestDispatcher2>(server.get());
     else
-        dispatcher = std::make_unique<KeeperRequestDispatcher>(server.get(), &keeper_stats);
+        dispatcher = std::make_unique<KeeperRequestDispatcher>(server.get());
 
     try
     {
@@ -271,7 +274,7 @@ void KeeperDispatcher::forceRecovery()
 
 KeeperDispatcher::~KeeperDispatcher()
 {
-    shutdown();
+    shutdown(false);
 }
 
 void KeeperDispatcher::registerSession(int64_t session_id, ZooKeeperResponseCallback callback)
@@ -335,26 +338,26 @@ void KeeperDispatcher::finishSession(int64_t session_id)
         dispatcher2->finishSession(session_id);
 }
 
-void onSessionIDResponse(const Coordination::ZooKeeperResponsePtr & response) noexcept
+void KeeperDispatcher::onSessionIDResponse(const Coordination::ZooKeeperResponsePtr & response) noexcept
 {
     chassert(response->getOpNum() == Coordination::OpNum::SessionID);
     const Coordination::ZooKeeperSessionIDResponse & session_id_resp = dynamic_cast<const Coordination::ZooKeeperSessionIDResponse &>(*response);
     if (session_id_resp.server_id != server->getServerID())
-        return false;
+        return;
 
-    ProfiledMutexLock lock(new_session_to_response_callback_mutex, ProfileEvents::KeeperSessionCallbackLockWaitMicroseconds, ProfileEvents::KeeperSessionCallbackLockHoldMicroseconds);
+    std::lock_guard lock(new_session_id_mutex);
 
     auto it = new_session_id_requests.find(session_id_resp.internal_id);
     if (it == new_session_id_requests.end())
-        return false;
+        return;
 
     if (response->error == Coordination::Error::ZOK)
-        promise->set_value(session_id_resp.session_id);
+        it->second.set_value(session_id_resp.session_id);
     else
-        promise->set_exception(
+        it->second.set_exception(
             std::make_exception_ptr(zkutil::KeeperException::fromMessage(response->error, "SessionID request failed with error")));
 
-    new_session_id_requests.erase(session_id_resp.internal_id);
+    new_session_id_requests.erase(it);
 }
 
 int64_t KeeperDispatcher::getSessionID(int64_t session_timeout_ms)
@@ -374,23 +377,24 @@ int64_t KeeperDispatcher::getSessionID(int64_t session_timeout_ms)
     request_info.time = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
     request_info.session_id = -1;
 
-    auto promise = std::make_shared<std::promise<int64_t>>();
-    auto future = promise->get_future();
+    std::future<int64_t> future;
 
     {
-        ProfiledMutexLock lock(new_session_to_response_callback_mutex, ProfileEvents::KeeperSessionCallbackLockWaitMicroseconds, ProfileEvents::KeeperSessionCallbackLockHoldMicroseconds);
-        new_session_id_requests[request->internal_id] = std::move(promise);
+        std::lock_guard lock(new_session_id_mutex);
+        auto [it, inserted] = new_session_id_requests.try_emplace(request->internal_id);
+        chassert(inserted);
+        future = it->second.get_future();
     }
 
     ZooKeeperOpentelemetrySpans::maybeInitialize(request->spans.dispatcher_requests_queue, request->tracing_context);
 
     /// Push new session request to queue
-    putReqeust(request, /*session_id=*/ -1, /*use_xid_64=*/ false);
+    putRequest(request, /*session_id=*/ -1, /*use_xid_64=*/ false);
 
     if (future.wait_for(std::chrono::milliseconds(session_timeout_ms)) != std::future_status::ready)
     {
         {
-            ProfiledMutexLock lock(new_session_to_response_callback_mutex, ProfileEvents::KeeperSessionCallbackLockWaitMicroseconds, ProfileEvents::KeeperSessionCallbackLockHoldMicroseconds);
+            std::lock_guard lock(new_session_id_mutex);
             new_session_id_requests.erase(request->internal_id);
         }
         throw Exception(ErrorCodes::TIMEOUT_EXCEEDED, "Cannot receive session id within session timeout");

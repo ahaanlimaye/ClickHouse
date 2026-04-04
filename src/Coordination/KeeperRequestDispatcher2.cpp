@@ -1,24 +1,64 @@
 #include <Coordination/KeeperRequestDispatcher2.h>
 
-#include <Coordination/CoordinationSettings.h>
-
 #if USE_NURAFT
+
+#include <Coordination/CoordinationSettings.h>
+#include <Common/setThreadName.h>
+#include <Common/CurrentMetrics.h>
+#include <Common/ProfileEvents.h>
+#include <Common/HistogramMetrics.h>
+#include <Common/formatReadable.h>
 
 template class NonblockingBoundedQueue<DB::KeeperRequestForSession>;
 template class NonblockingBoundedQueue<DB::KeeperResponseForSession>;
+
+namespace CurrentMetrics
+{
+    extern const Metric KeeperAliveConnections;
+    extern const Metric KeeperOutstandingRequests;
+}
+
+namespace ProfileEvents
+{
+    extern const Event KeeperCommitsFailed;
+    extern const Event KeeperBatchMaxCount;
+    extern const Event KeeperBatchMaxTotalSize;
+    extern const Event KeeperBatchMaxReadCount;
+    extern const Event KeeperBatchMaxReadTotalSize;
+    extern const Event KeeperRequestRejectedDueToSoftMemoryLimitCount;
+    extern const Event KeeperStaleRequestsSkipped;
+    extern const Event KeeperReadBatchCount;
+    extern const Event KeeperReadBatchTotalRequests;
+}
+
+namespace HistogramMetrics
+{
+    extern Metric & KeeperCurrentBatchSizeElements;
+    extern Metric & KeeperCurrentBatchSizeBytes;
+}
 
 namespace DB
 {
 
 namespace CoordinationSetting
 {
+    extern const CoordinationSettingsUInt64 max_request_queue_size;
+    extern const CoordinationSettingsUInt64 max_requests_batch_bytes_size;
+    extern const CoordinationSettingsUInt64 max_requests_batch_size;
     extern const CoordinationSettingsMilliseconds operation_timeout_ms;
     extern const CoordinationSettingsBool quorum_reads;
+    extern const CoordinationSettingsMilliseconds session_shutdown_timeout;
+}
+
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+    extern const int TIMEOUT_EXCEEDED;
 }
 
 static size_t getSubrequestCount(const Coordination::ZooKeeperRequest & request)
 {
-    if (auto multi = typeid_cast<const ZooKeeperMultiRequest *>(&request))
+    if (auto multi = typeid_cast<const Coordination::ZooKeeperMultiRequest *>(&request))
         return multi->requests.size();
     else
         return 1;
@@ -100,7 +140,7 @@ KeeperRequestDispatcher2::KeeperRequestDispatcher2(KeeperServer * server_)
     ///       set its size to, say, 100k and it'll never overflow in practice (remember that there's
     ///        a byte limit in dispatch thread preventing us from starting more requests if response
     ///        queue is big).
-    responses_queue.init(size_t(max_request_queue_size * 3.0));
+    responses_queue.init(static_cast<size_t>(static_cast<double>(max_request_queue_size) * 3.0));
 
     dispatch_thread = ThreadFromGlobalPool([this] { dispatchThread(); });
     response_thread = ThreadFromGlobalPool([this] { responseThread(); });
@@ -220,7 +260,7 @@ bool KeeperRequestDispatcher2::putRequest(const Coordination::ZooKeeperRequestPt
             if (try_push())
                 break;
 
-            if (std::chrono::steady_clock::now() - start_time > keeper_context->getCoordinationSettings()[CoordinationSetting::operation_timeout_ms])
+            if (std::chrono::steady_clock::now() - start_time > std::chrono::milliseconds(keeper_context->getCoordinationSettings()[CoordinationSetting::operation_timeout_ms].totalMilliseconds()))
                 throw Exception(ErrorCodes::TIMEOUT_EXCEEDED, "Cannot push request to queue within operation timeout");
         }
     }
@@ -418,7 +458,7 @@ void KeeperRequestDispatcher2::dispatchThread()
             size_t batch_idx = tail_idx.load();
             size_t num_batches_in_flight = batch_idx - head_idx.load();
             //TODO: settings for response queue byte size limit; use half that limit here
-            if (num_batches_in_flight >= in_flight_batches.size() || responses_bytes_in_all_queues.load() > 100000000)
+            if (num_batches_in_flight >= in_flight_batches.size() || response_bytes_in_all_queues.load() > 100000000)
             {
                 /// Too many batches in flight. Busy-wait.
                 ///
@@ -478,7 +518,7 @@ void KeeperRequestDispatcher2::dispatchThread()
             auto & coordination_settings = keeper_context->getCoordinationSettings();
             uint64_t max_batch_bytes_size = coordination_settings[CoordinationSetting::max_requests_batch_bytes_size];
             size_t max_batch_size = coordination_settings[CoordinationSetting::max_requests_batch_size];
-            bool quorum_reads = coordination_settings[CoordinationSettings::quorum_reads];
+            bool quorum_reads = coordination_settings[CoordinationSetting::quorum_reads];
             /// TODO: Take these from settings once https://github.com/ClickHouse/ClickHouse/pull/100778 lands.
             size_t max_read_batch_size = 100000;
             size_t max_read_batch_bytes_size = 10000000;
@@ -658,7 +698,6 @@ void KeeperRequestDispatcher2::dispatchThread()
 void KeeperRequestDispatcher2::popBatch(size_t batch_idx)
 {
     auto & batch = in_flight_batches[batch_idx % in_flight_batches.size()];
-    size_t bytes = batch.bytes;
     batch.deactivate();
     head_idx.store(batch_idx + 1);
 }
@@ -714,16 +753,6 @@ void KeeperRequestDispatcher2::onCommit(const KeeperRequestForSession & request_
 
     std::lock_guard stream_lock(request_completion_mutex);
 
-    auto is_same_request = [&](size_t batch_idx, size_t request_idx)
-    {
-        auto & batch = in_flight_batches[batch_idx % in_flight_batches.size()];
-        if (!batch.active.load())
-            return false;
-        const auto & req = batch.requests.at(request_idx);
-        return req.session_id == request_for_session.session_id &&
-                req.request->xid == request_for_session.request->xid;
-    };
-
     /// We expect requests to be committed in order with no gaps.
     /// So we only have to check if the newly committed request is the first one in our queue.
     size_t batch_idx = head_idx.load();
@@ -770,7 +799,7 @@ void KeeperRequestDispatcher2::onCommit(const KeeperRequestForSession & request_
 
 void KeeperRequestDispatcher2::onResponseDeallocated(const Coordination::ZooKeeperResponse & response)
 {
-    responses_bytes_in_all_queues.fetch_sub(getResponseBytesCost(response));
+    response_bytes_in_all_queues.fetch_sub(getResponseBytesCost(response));
 }
 
 void KeeperRequestDispatcher2::responseThread()
