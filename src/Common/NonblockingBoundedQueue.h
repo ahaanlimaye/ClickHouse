@@ -136,6 +136,7 @@ public:
         }
     }
 
+    /// (May overestimate a bit if called in parallel with lots of pushes and pops.)
     size_t size() const
     {
         size_t y = dequeue_pos.load();
@@ -152,6 +153,6 @@ private:
 
     size_t mask = 0; // capacity - 1
     std::vector<Slot> slots;
-    alignas(DB::CH_CACHE_LINE_SIZE) std::atomic<size_t> enqueue_pos;
-    alignas(DB::CH_CACHE_LINE_SIZE) std::atomic<size_t> dequeue_pos;
+    alignas(DB::CH_CACHE_LINE_SIZE) std::atomic<size_t> enqueue_pos {};
+    alignas(DB::CH_CACHE_LINE_SIZE) std::atomic<size_t> dequeue_pos {};
 };

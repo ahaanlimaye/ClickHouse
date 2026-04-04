@@ -155,9 +155,10 @@ void KeeperRequestDispatcher2::shutdown(bool closed_all_connections)
     dispatch_thread.join();
     response_thread.join();
 
-    /// Drain queues to check for counter leaks.
+    /// Drain queues just to check for counter leaks.
     /// Don't bother sending replies because client connections should already be closed by now
     /// (or stuck and timed out, if closed_all_connections is false).
+    /// Don't need to do anything witht in_flight_batches.
     KeeperRequestForSession request_for_session;
     while (tryPopRequest(request_for_session)) {}
     KeeperResponseForSession response_for_session;
@@ -653,8 +654,6 @@ void KeeperRequestDispatcher2::dispatchThread()
                         batch_bytes += request.request->bytesSize();
                         requests.push_back(std::move(request));
                     }
-
-                    requests.push_back(std::move(request));
                 } while (check_batch_size_limits() && tryPopRequest(request));
 
                 flush_deferred_reads();
@@ -764,7 +763,7 @@ void KeeperRequestDispatcher2::onCommit(const KeeperRequestForSession & request_
         req.request->xid != request_for_session.request->xid)
         return;
 
-    if (!current_stream_is_suspect.load())
+    if (current_stream_is_suspect.load())
         current_stream_is_suspect.store(false); // a request succeeded, the stream is working
 
     if (batch.reads_idx < batch.reads.size() && batch.reads[batch.reads_idx].first == batch.committed_requests + 1)

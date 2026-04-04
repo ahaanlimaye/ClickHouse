@@ -53,6 +53,7 @@ private:
     std::unique_ptr<KeeperServer> server;
 
     /// Exactly one of these is non-null.
+    /// Hopefully KeeperRequestDispatcher2 will work well and we'll delete KeeperRequestDispatcher soon.
     std::unique_ptr<KeeperRequestDispatcher> dispatcher;
     std::unique_ptr<KeeperRequestDispatcher2> dispatcher2;
 
@@ -102,8 +103,6 @@ public:
     /// standalone_keeper -- we are standalone keeper application (not inside clickhouse server)
     /// 'macros' are used to substitute macros in endpoint of disks
     void initialize(const Poco::Util::AbstractConfiguration & config, bool standalone_keeper, bool start_async, const MultiVersion<Macros>::Version & macros);
-
-    void startServer();
 
     bool checkInit() const
     {
