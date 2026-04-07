@@ -364,6 +364,14 @@ void StorageMaterializedView::read(
         std::tie(storage, lock) = refresher->getAndLockTargetTable(getTargetTableId(), context);
     }
 
+    /// For datalake target tables (e.g. IcebergLocal), we must refresh external metadata
+    /// before reading. Without this call the storage snapshot will lack the
+    /// datalake_table_state, causing a LOGICAL_ERROR in iterate().
+    /// Normally updateExternalDynamicMetadataIfExists is called by the analyzer/interpreter
+    /// on the outermost storage, but for materialized views that is the view itself
+    /// (which is a no-op), not the target table.
+    storage->updateExternalDynamicMetadataIfExists(context);
+
     auto target_metadata_snapshot = storage->getInMemoryMetadataPtr();
     auto target_storage_snapshot = storage->getStorageSnapshot(target_metadata_snapshot, context);
     auto target_column_names = VirtualColumnUtils::filterVirtualColumns(column_names, {"_table", "_database"}, target_metadata_snapshot, target_storage_snapshot->virtual_columns);

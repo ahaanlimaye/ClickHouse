@@ -171,6 +171,10 @@ Names filterVirtualColumns(
     const StorageMetadataPtr & metadata_snapshot,
     const VirtualsDescriptionPtr & virtual_columns);
 
+/// Splits requested column names into physical and virtual.
+/// Returns {physical_names, virtual_names}. Always includes at least one physical column.
+std::pair<Names, Names> splitPhysicalAndVirtualColumnNames(const Names & column_names, const StorageSnapshotPtr & storage_snapshot);
+
 }
 
 }
