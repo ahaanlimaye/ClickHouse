@@ -73,6 +73,11 @@ static size_t getSubrequestCount(const Coordination::ZooKeeperRequest & request)
         return 1;
 }
 
+/// Estimated memory used by a request/response struct, for queue size byte limits.
+static size_t getRequestBytesCost(const Coordination::ZooKeeperRequest & request)
+{
+    return request.bytesSize() + sizeof(Coordination::ZooKeeperRequest);
+}
 static size_t getResponseBytesCost(const Coordination::ZooKeeperResponse & response)
 {
     return response.bytesSize() + sizeof(Coordination::ZooKeeperResponse);
@@ -90,6 +95,11 @@ static bool checkIfRequestIncreaseMem(const Coordination::ZooKeeperRequestPtr & 
     if (request->getOpNum() == Coordination::OpNum::Multi)
     {
         Coordination::ZooKeeperMultiRequest & multi_req = dynamic_cast<Coordination::ZooKeeperMultiRequest &>(*request);
+        /// Add up sizes of create/set requests, subtract sizes of remove requests.
+        /// This doesn't really make sense because we're interested in memory usage of znodes, not requests.
+        /// But we don't know znode sizes at this point (is the Remove removing a small or big znode?),
+        /// so can't do much better here. Maybe it would make sense to move this check to preprocessRequest,
+        /// where we have access to the znode states.
         Int64 memory_delta = 0;
         for (const auto & sub_req : multi_req.requests)
         {
@@ -249,7 +259,7 @@ bool KeeperRequestDispatcher2::putRequest(const Coordination::ZooKeeperRequestPt
 
     ZooKeeperOpentelemetrySpans::maybeInitialize(request->spans.dispatcher_requests_queue, request->tracing_context);
 
-    uint64_t max_request_queue_bytes = keeper_context->getCoordinationSettings()[CoordinationSetting::max_request_queue_bytes_size];
+    int64_t max_request_queue_bytes = int64_t(keeper_context->getCoordinationSettings()[CoordinationSetting::max_request_queue_bytes_size]);
     auto try_push = [&]
     {
         return requests_queue_bytes.load() <= max_request_queue_bytes && requests_queue.tryPush(std::move(request_info));
@@ -274,7 +284,9 @@ bool KeeperRequestDispatcher2::putRequest(const Coordination::ZooKeeperRequestPt
         }
     }
 
-    requests_queue_bytes.fetch_add(request->bytesSize());
+    /// requests_queue_bytes may briefly become negative if the other thread popped the request and
+    /// decreased requests_queue_bytes before we got here.
+    requests_queue_bytes.fetch_add(int64_t(getRequestBytesCost(*request)));
     CurrentMetrics::add(CurrentMetrics::KeeperOutstandingRequests);
 
     return true;
@@ -291,7 +303,7 @@ bool KeeperRequestDispatcher2::tryPopRequest(KeeperRequestForSession & request)
     bool res = requests_queue.tryPop(request);
     if (res)
     {
-        requests_queue_bytes.fetch_sub(request.request->bytesSize());
+        requests_queue_bytes.fetch_sub(int64_t(getRequestBytesCost(*request.request)));
         CurrentMetrics::sub(CurrentMetrics::KeeperOutstandingRequests);
 
         ZooKeeperOpentelemetrySpans::maybeFinalize(
@@ -311,8 +323,8 @@ bool KeeperRequestDispatcher2::tryPopRequest(KeeperRequestForSession & request)
 
 void KeeperRequestDispatcher2::onResponse(KeeperResponseForSession response) noexcept
 {
-    size_t bytes = getResponseBytesCost(*response.response);
-    uint64_t max_response_queue_bytes = keeper_context->getCoordinationSettings()[CoordinationSetting::max_response_queue_bytes_size];
+    size_t size = getResponseBytesCost(*response.response);
+    int64_t max_response_queue_bytes = int64_t(keeper_context->getCoordinationSettings()[CoordinationSetting::max_response_queue_bytes_size]);
     auto try_push = [&]
     {
         return response_bytes_in_all_queues.load() <= max_response_queue_bytes && responses_queue.tryPush(std::move(response));
@@ -351,7 +363,9 @@ void KeeperRequestDispatcher2::onResponse(KeeperResponseForSession response) noe
         }
     }
 
-    response_bytes_in_all_queues.fetch_add(bytes);
+    /// response_bytes_in_all_queues may briefly become negative if the other thread
+    /// popped the request and decreased the counter before we got here.
+    response_bytes_in_all_queues.fetch_add(int64_t(size));
 }
 
 void KeeperRequestDispatcher2::registerSession(int64_t session_id, ZooKeeperResponseCallback callback)
@@ -384,12 +398,15 @@ void KeeperRequestDispatcher2::finishSession(int64_t session_id)
 
     if (callback)
     {
-        /// This is useful only in the weird case where a session was timed out by sessionCleanerTask
+        /// This is useful only in the unusual case where a session was timed out by sessionCleanerTask
         /// while the session's KeeperTCPHandler socket is still open. Then the callback tells
         /// KeeperTCPHandler to close the socket.
         auto close_response = std::make_shared<Coordination::ZooKeeperCloseResponse>();
         close_response->error = Coordination::Error::ZSESSIONEXPIRED;
-        callback(close_response, nullptr);
+        size_t size = getResponseBytesCost(*close_response);
+        response_bytes_in_all_queues.fetch_add(size);
+        if (!callback(close_response, nullptr))
+            response_bytes_in_all_queues.fetch_sub(size);
     }
 }
 
@@ -470,7 +487,7 @@ void KeeperRequestDispatcher2::dispatchThread()
             /// network.
             size_t batch_idx = tail_idx.load();
             size_t num_batches_in_flight = batch_idx - head_idx.load();
-            uint64_t max_response_queue_bytes = keeper_context->getCoordinationSettings()[CoordinationSetting::max_response_queue_bytes_size];
+            int64_t max_response_queue_bytes = int64_t(keeper_context->getCoordinationSettings()[CoordinationSetting::max_response_queue_bytes_size]);
             if (num_batches_in_flight >= in_flight_batches.size() || response_bytes_in_all_queues.load() > max_response_queue_bytes / 2)
             {
                 /// Too many batches in flight. Busy-wait.
@@ -596,13 +613,19 @@ void KeeperRequestDispatcher2::dispatchThread()
 
                 do
                 {
-                    auto it = sessions.find(request.session_id);
-                    if (it == sessions.end() || it->second.dead.load())
+                    Session * session = nullptr;
+                    auto op = request.request->getOpNum();
+                    if (op != Coordination::OpNum::Close &&
+                        op != Coordination::OpNum::SessionID)
                     {
-                        ProfileEvents::increment(ProfileEvents::KeeperStaleRequestsSkipped);
-                        continue;
+                        auto it = sessions.find(request.session_id);
+                        if (it == sessions.end() || it->second.dead.load())
+                        {
+                            ProfileEvents::increment(ProfileEvents::KeeperStaleRequestsSkipped);
+                            continue;
+                        }
+                        session = &it->second;
                     }
-                    Session & session = it->second;
 
                     if (request.request->getOpNum() == Coordination::OpNum::Reconfig)
                     {
@@ -651,18 +674,19 @@ void KeeperRequestDispatcher2::dispatchThread()
 
                     if (is_read)
                     {
-                        session.reordering_version = current_reordering_version;
+                        if (session)
+                            session->reordering_version = current_reordering_version;
                         reads_subrequests += getSubrequestCount(*request.request);
-                        reads_bytes += request.request->bytesSize();
+                        reads_bytes += getRequestBytesCost(*request.request);
                         deferred_reads.push_back(std::move(request));
                     }
                     else
                     {
-                        if (session.reordering_version == current_reordering_version || !optimize_read_order)
+                        if ((session && session->reordering_version == current_reordering_version) || !optimize_read_order)
                             flush_deferred_reads();
 
                         batch_subrequests += getSubrequestCount(*request.request);
-                        batch_bytes += request.request->bytesSize();
+                        batch_bytes += getRequestBytesCost(*request.request);
                         requests.push_back(std::move(request));
                     }
                 } while (check_batch_size_limits() && tryPopRequest(request));
@@ -809,7 +833,8 @@ void KeeperRequestDispatcher2::onCommit(const KeeperRequestForSession & request_
 
 void KeeperRequestDispatcher2::onResponseDeallocated(const Coordination::ZooKeeperResponse & response)
 {
-    response_bytes_in_all_queues.fetch_sub(getResponseBytesCost(response));
+    size_t size = getResponseBytesCost(response);
+    response_bytes_in_all_queues.fetch_sub(size);
 }
 
 void KeeperRequestDispatcher2::responseThread()

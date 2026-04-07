@@ -386,8 +386,6 @@ int64_t KeeperDispatcher::getSessionID(int64_t session_timeout_ms)
         future = it->second.get_future();
     }
 
-    ZooKeeperOpentelemetrySpans::maybeInitialize(request->spans.dispatcher_requests_queue, request->tracing_context);
-
     /// Push new session request to queue
     putRequest(request, /*session_id=*/ -1, /*use_xid_64=*/ false);
 

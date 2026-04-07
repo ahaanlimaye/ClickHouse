@@ -14,7 +14,8 @@
 /// (but this contention shouldn't slow down the producer, if the consumer busy-waits).
 ///
 /// Background:
-//asdqwe maybe write a better comment.
+/// (Optional reading. This is one possible way to look at task queues. May or may not be a good one
+///  in any given situation.)
 ///
 /// When using a task queue to pass requests from one thread to another, it makes sense for the task
 /// queue to have these properties:

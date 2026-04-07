@@ -49,6 +49,7 @@ private:
         void forceReconfigure(const nuraft::ptr<nuraft::cluster_config> & new_config);
 
         void commit_in_bg() override;
+        void append_entries_in_bg() override;
 
         std::unique_lock<std::recursive_mutex> lockRaft();
 

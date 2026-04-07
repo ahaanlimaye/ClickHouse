@@ -30,6 +30,7 @@
 #include <Common/Stopwatch.h>
 #include <Common/getMultipleKeysFromConfig.h>
 #include <Common/getNumberOfCPUCoresToUse.h>
+#include <Common/setThreadName.h>
 
 #if USE_SSL
 #    include <Server/CertificateReloader.h>
@@ -323,6 +324,7 @@ void KeeperServer::KeeperRaftServer::forceReconfigure(const nuraft::ptr<nuraft::
 
 void KeeperServer::KeeperRaftServer::commit_in_bg()
 {
+    DB::setThreadName(ThreadName::KEEPER_COMMIT);
     // For NuRaft, if any commit fails (uncaught exception) the whole server aborts as a safety
     // This includes failed allocation which can produce an unknown state for the storage,
     // making it impossible to handle correctly.
@@ -330,6 +332,13 @@ void KeeperServer::KeeperRaftServer::commit_in_bg()
     // assuming that the allocations are small
     LockMemoryExceptionInThread blocker{VariableContext::Global};
     nuraft::raft_server::commit_in_bg();
+}
+
+void KeeperServer::KeeperRaftServer::append_entries_in_bg()
+{
+    DB::setThreadName(ThreadName::KEEPER_APPEND);
+    LockMemoryExceptionInThread blocker{VariableContext::Global};
+    nuraft::raft_server::append_entries_in_bg();
 }
 
 std::unique_lock<std::recursive_mutex> KeeperServer::KeeperRaftServer::lockRaft()
