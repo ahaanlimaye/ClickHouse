@@ -410,6 +410,18 @@ void SettingFieldMap::parseFromString(const String & str)
     *this = stringToMap(str);
 }
 
+void SettingFieldMap::writeBinary(WriteBuffer & out) const
+{
+    writeStringBinary(toString(), out);
+}
+
+void SettingFieldMap::readBinary(ReadBuffer & in)
+{
+    String str;
+    readStringBinaryGrowing(str, in);
+    parseFromString(str);
+}
+
 namespace
 {
     char stringToChar(const String & str)

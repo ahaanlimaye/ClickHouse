@@ -9,10 +9,13 @@
 #include <base/unit.h>
 
 #include <limits>
+#include <memory>
 #include <string_view>
 
 namespace DB
 {
+
+struct Map;
 
 /// Arrow offsets its `Utf8`, `Binary` and `List` buffers with 32-bit integers, and the Apache Arrow
 /// builders additionally reject the last representable value.
@@ -365,6 +368,7 @@ struct FormatSettings : FormatSettingsEnums
         size_t memory_high_watermark = 4ul << 30;
 
         /// Write.
+        std::shared_ptr<const Map> output_field_ids;
         UInt64 row_group_rows = 1000000;
         UInt64 row_group_bytes = 512 * 1024 * 1024;
         bool output_string_as_string = false;

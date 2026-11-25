@@ -11,6 +11,7 @@
 #include <IO/WriteBufferFromVector.h>
 #include <Processors/Port.h>
 
+#include <charconv>
 #include <optional>
 
 
@@ -19,6 +20,7 @@ namespace DB
 
 namespace ErrorCodes
 {
+    extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
 }
 
@@ -67,6 +69,7 @@ ParquetBlockOutputFormat::ParquetBlockOutputFormat(WriteBuffer & out_, SharedHea
     options.max_dictionary_size = format_settings.parquet.max_dictionary_size;
     options.use_dictionary_encoding = options.max_dictionary_size > 0;
 
+    ColumnNameToFieldId explicit_ids;
     if (format_filter_info_ && format_filter_info_->column_mapper)
     {
         /// The mapper outlives this format (and the encoder threads) via format_filter_info.
@@ -74,16 +77,27 @@ ParquetBlockOutputFormat::ParquetBlockOutputFormat(WriteBuffer & out_, SharedHea
         /// max definition level from the schema, while the writer takes the level bit width from the
         /// state the data path builds, so the two would desynchronize.
         iceberg_optionality.mapper = format_filter_info_->column_mapper.get();
-        /// `convertSchema` reads an empty encoding map as "every field id is missing", not "no field ids".
-        const auto & column_encoding = format_filter_info_->column_mapper->getStorageColumnEncoding();
-        schema = convertSchema(
-            *header_,
-            options,
-            column_encoding.empty() ? std::nullopt : std::optional(column_encoding),
-            iceberg_optionality);
     }
-    else
-        schema = convertSchema(*header_, options, std::nullopt, iceberg_optionality);
+    else if (format_settings.parquet.output_field_ids)
+    {
+        UnorderedSetWithMemoryTracking<Int32> used_ids;
+        for (const auto & entry : *format_settings.parquet.output_field_ids)
+        {
+            const auto & pair = entry.safeGet<Tuple>();
+            const auto & path = pair.at(0).safeGet<String>();
+            const auto & value = pair.at(1).safeGet<String>();
+            Int32 id = 0;
+            const auto * end = value.data() + value.size();
+            const auto [ptr, error] = std::from_chars(value.data(), end, id);
+            if (error != std::errc{} || ptr != end || id <= 0)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expected a positive Int32 Parquet field ID for '{}', got '{}'", path, value);
+            if (!explicit_ids.emplace(path, id).second)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Duplicate Parquet field path '{}'", path);
+            if (!used_ids.insert(id).second)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Duplicate Parquet field ID {}", id);
+        }
+    }
+    schema = convertSchema(*header_, options, iceberg_optionality, std::move(explicit_ids));
 }
 
 ParquetBlockOutputFormat::~ParquetBlockOutputFormat()
@@ -339,7 +353,7 @@ void ParquetBlockOutputFormat::writeRowGroupInOneThread(Chunk chunk)
     for (size_t i = 0; i < header.columns(); ++i)
         prepareColumnForWrite(
             chunk.getColumns()[i], header.getByPosition(i).type, header.getByPosition(i).name,
-            options, &columns_to_write, /*out_schema*/ nullptr, /*column_field_ids*/ std::nullopt, iceberg_optionality);
+            options, &columns_to_write, /*out_schema*/ nullptr, /*set_field_id*/ {}, iceberg_optionality);
 
     if (file_state.offset == 0)
     {
@@ -508,7 +522,7 @@ void ParquetBlockOutputFormat::threadFunction(ThreadGroupPtr & thread_group)
             VectorWithMemoryTracking<ColumnChunkWriteState> subcolumns;
             prepareColumnForWrite(
                 std::move(concatenated), task.column_type, task.column_name, options, &subcolumns,
-                /*out_schema*/ nullptr, /*column_field_ids*/ std::nullopt, iceberg_optionality);
+                /*out_schema*/ nullptr, /*set_field_id*/ {}, iceberg_optionality);
 
             lock.lock();
 

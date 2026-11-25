@@ -243,6 +243,8 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.always_write_decimal_point_in_float_and_decimal = settings[Setting::output_format_always_write_decimal_point_in_float_and_decimal];
     format_settings.float_precision = settings[Setting::output_format_float_precision];
     format_settings.trim_fixed_string = settings[Setting::output_format_trim_fixed_string];
+    if (const auto & ids = settings[Setting::output_format_parquet_field_ids].value; !ids.empty())
+        format_settings.parquet.output_field_ids = std::make_shared<const Map>(ids);
     format_settings.parquet.row_group_rows = settings[Setting::output_format_parquet_row_group_size];
     format_settings.parquet.row_group_bytes = settings[Setting::output_format_parquet_row_group_size_bytes];
 

@@ -30,6 +30,7 @@ struct FileLogSettingsImpl;
     M(CLASS_NAME, IntervalOutputFormat) \
     M(CLASS_NAME, MaxThreads) \
     M(CLASS_NAME, Milliseconds) \
+    M(CLASS_NAME, Map) \
     M(CLASS_NAME, MsgPackUUIDRepresentation) \
     M(CLASS_NAME, ORCCompression) \
     M(CLASS_NAME, ParquetCompression) \

@@ -2048,6 +2048,12 @@ When reading Parquet files, decode geometry columns as ClickHouse geo types (`Po
 Read a Parquet group that has no `VARIANT` logical type, but has the layout of an unshredded variant (a `metadata` and a `value` field of type `BYTE_ARRAY`), as a variant, i.e. as `Dynamic`, instead of `Tuple`. Spark 4.0 writes variant columns this way. Groups annotated with the `VARIANT` logical type are always read as a variant.
 )", 0, \
         {"26.10", false, true, "New setting to read Spark variant columns, which have no `VARIANT` logical type, as `Dynamic` instead of `Tuple`"}) \
+    DECLARE(Map, output_format_parquet_field_ids, "", R"(
+Assign Iceberg field IDs to the schema of an ordinary Parquet export. Supply a map from output field paths to decimal strings containing unique positive 32-bit signed integers. A nonempty map must cover each exported field exactly once. Use the output column name for a top-level field, append the member name for a `Tuple`, `.element` for an `Array`, and `.key` or `.value` for a `Map`. Dotted paths must be unambiguous.
+
+For example, `SETTINGS output_format_parquet_field_ids = {'tags': '19', 'tags.element': '31', 'id': '4'}` writes the IDs from an existing Iceberg schema regardless of column order. An empty map leaves ordinary exports without field IDs. Iceberg table writes always use their own schema metadata.
+)", 0, \
+        {"26.12", "", "", "New setting for explicit Parquet field IDs"}) \
     DECLARE(Bool, output_format_parquet_geometadata, true, R"(
 Allow to write information about geo columns in parquet metadata and encode columns in WKB format.
 )", 0, \
